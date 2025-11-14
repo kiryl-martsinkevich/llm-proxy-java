@@ -1,0 +1,16 @@
+{
+  "server": {
+    "host": "localhost",
+    "port": 8080
+  },
+  "routes": [
+    {
+      "incomingModel": "gpt-4",
+      "provider": {
+        "type": "OLLAMA",
+        "baseUrl": "http://localhost:11434",
+        "targetModel": "llama3.2:1b"
+      }
+    }
+  ]
+}
