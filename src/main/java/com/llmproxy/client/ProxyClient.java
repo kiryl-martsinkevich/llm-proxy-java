@@ -138,8 +138,23 @@ public class ProxyClient {
                         }
                     });
 
+                    // Handle response based on provider type
+                    JsonObject responseBody;
+
+                    if (route.getProvider().getType() == ProviderConfig.Type.OLLAMA) {
+                        // Ollama returns NDJSON (newline-delimited JSON), parse the last complete message
+                        responseBody = parseOllamaResponse(response.bodyAsString());
+                    } else {
+                        // OpenAI and Anthropic return standard JSON
+                        try {
+                            responseBody = response.bodyAsJsonObject();
+                        } catch (Exception e) {
+                            logger.error("Failed to parse response as JSON", e);
+                            responseBody = null;
+                        }
+                    }
+
                     // Transform response if needed
-                    JsonObject responseBody = response.bodyAsJsonObject();
                     if (responseBody != null && !route.getTransformations().getResponse().getJsonPathOps().isEmpty()) {
                         responseBody = jsonPathTransformer.transform(responseBody, route.getTransformations().getResponse());
                     }
@@ -162,6 +177,31 @@ public class ProxyClient {
                     return Future.succeededFuture();
                 })
                 .mapEmpty();
+    }
+
+    private JsonObject parseOllamaResponse(String ndjson) {
+        // Parse NDJSON and return the last message (which has "done": true)
+        String[] lines = ndjson.split("\n");
+        JsonObject lastMessage = null;
+
+        for (String line : lines) {
+            if (line.trim().isEmpty()) {
+                continue;
+            }
+            try {
+                JsonObject obj = new JsonObject(line);
+                lastMessage = obj;
+
+                // If this is the done message, we can stop
+                if (obj.getBoolean("done", false)) {
+                    break;
+                }
+            } catch (Exception e) {
+                logger.warn("Failed to parse NDJSON line: {}", line);
+            }
+        }
+
+        return lastMessage;
     }
 
     private Future<Void> handleStreamingRequest(RoutingContext ctx, HttpRequest<Buffer> request, JsonObject body) {
