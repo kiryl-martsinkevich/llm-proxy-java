@@ -93,6 +93,14 @@ public class ProxyClient {
             result = contentTransformer.replaceModel(result, route.getProvider().getTargetModel());
         }
 
+        // For Ollama, ensure stream parameter matches the request
+        // If stream is not set or false, explicitly set it to false
+        if (route.getProvider().getType() == ProviderConfig.Type.OLLAMA) {
+            if (!result.containsKey("stream")) {
+                result.put("stream", false);
+            }
+        }
+
         // Apply JSONPath transformations
         if (!route.getTransformations().getRequest().getJsonPathOps().isEmpty()) {
             result = jsonPathTransformer.transform(result, route.getTransformations().getRequest());
