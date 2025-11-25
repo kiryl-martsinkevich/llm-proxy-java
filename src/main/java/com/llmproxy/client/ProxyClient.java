@@ -5,6 +5,7 @@ import com.llmproxy.config.RouteConfig;
 import com.llmproxy.transformer.ContentTransformer;
 import com.llmproxy.transformer.HeaderTransformer;
 import com.llmproxy.transformer.JsonPathTransformer;
+import com.llmproxy.util.RetryHandler;
 import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
@@ -34,6 +35,7 @@ public class ProxyClient {
     private final HeaderTransformer headerTransformer;
     private final ContentTransformer contentTransformer;
     private final JsonPathTransformer jsonPathTransformer;
+    private final RetryHandler retryHandler;
 
     public ProxyClient(Vertx vertx) {
         this.vertx = vertx;
@@ -41,6 +43,7 @@ public class ProxyClient {
         this.headerTransformer = new HeaderTransformer();
         this.contentTransformer = new ContentTransformer();
         this.jsonPathTransformer = new JsonPathTransformer();
+        this.retryHandler = new RetryHandler(vertx);
     }
 
     private WebClient getWebClient(boolean verifySsl) {
@@ -151,8 +154,23 @@ public class ProxyClient {
 
     private Future<Void> handleNonStreamingRequest(RoutingContext ctx, HttpRequest<Buffer> request,
                                                      JsonObject body, RouteConfig route) {
-        return request.sendJsonObject(body)
-                .compose(response -> {
+        // Wrap request in retry logic
+        int maxRetries = route.getClient().getRetries();
+        String context = String.format("Request to %s (model: %s)",
+                route.getProvider().getBaseUrl(), route.getIncomingModel());
+
+        return retryHandler.executeWithRetry(
+                () -> request.sendJsonObject(body).compose(response -> {
+                    // Check if response status is retryable
+                    if (RetryHandler.isRetryableStatusCode(response.statusCode())) {
+                        return Future.failedFuture(
+                                new RuntimeException("Retryable HTTP status: " + response.statusCode()));
+                    }
+                    return Future.succeededFuture(response);
+                }),
+                maxRetries,
+                context
+        ).compose(response -> {
                     // Forward response
                     ctx.response()
                             .setStatusCode(response.statusCode())
