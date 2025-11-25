@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew test:*)",
+      "Bash(./gradlew build:*)",
+      "Bash(./gradlew:*)",
+      "Bash(chmod:*)",
+      "Bash(groups $USER)",
+      "Read(//tmp/**)",
+      "Bash(docker exec:*)",
+      "Bash(curl:*)",
+      "Bash(unzip:*)",
+      "Bash(npm install)",
+      "Bash(docker ps:*)",
+      "Bash(pkill:*)",
+      "Bash(nc:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:clickhouse.com)",
+      "Bash(docker logs:*)",
+      "Bash(docker-compose restart:*)",
+      "Bash(cat:*)",
+      "Bash(find:*)",
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "WebFetch",
+      "Grep",
+      "LS",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ],
+    "deny": [],
+    "ask": [
+      "Bash(sudo:*)"
+    ]
+  }
+}

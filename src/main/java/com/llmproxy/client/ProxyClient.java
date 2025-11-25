@@ -15,30 +15,47 @@ import io.vertx.ext.web.client.HttpRequest;
 import io.vertx.ext.web.client.HttpResponse;
 import io.vertx.ext.web.client.WebClient;
 import io.vertx.ext.web.client.WebClientOptions;
+import io.vertx.core.streams.WriteStream;
+import io.vertx.core.streams.Pump;
+import io.vertx.core.streams.ReadStream;
+import io.vertx.ext.web.codec.BodyCodec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.URI;
+import java.util.HashMap;
+import java.util.Map;
 
 public class ProxyClient {
     private static final Logger logger = LoggerFactory.getLogger(ProxyClient.class);
 
-    private final WebClient webClient;
+    private final Vertx vertx;
+    private final Map<Boolean, WebClient> webClientCache;
     private final HeaderTransformer headerTransformer;
     private final ContentTransformer contentTransformer;
     private final JsonPathTransformer jsonPathTransformer;
 
     public ProxyClient(Vertx vertx) {
-        WebClientOptions options = new WebClientOptions()
-                .setKeepAlive(true)
-                .setMaxPoolSize(100)
-                .setConnectTimeout(10000)
-                .setIdleTimeout(120);
-
-        this.webClient = WebClient.create(vertx, options);
+        this.vertx = vertx;
+        this.webClientCache = new HashMap<>();
         this.headerTransformer = new HeaderTransformer();
         this.contentTransformer = new ContentTransformer();
         this.jsonPathTransformer = new JsonPathTransformer();
+    }
+
+    private WebClient getWebClient(boolean verifySsl) {
+        return webClientCache.computeIfAbsent(verifySsl, verify -> {
+            WebClientOptions options = new WebClientOptions()
+                    .setKeepAlive(true)
+                    .setMaxPoolSize(100)
+                    .setConnectTimeout(10000)
+                    .setIdleTimeout(120)
+                    .setVerifyHost(verify)
+                    .setTrustAll(!verify);
+
+            logger.debug("Created WebClient with SSL verification: {}", verify);
+            return WebClient.create(vertx, options);
+        });
     }
 
     public Future<Void> forwardRequest(RoutingContext ctx, JsonObject requestBody, RouteConfig route, boolean stream) {
@@ -52,8 +69,11 @@ public class ProxyClient {
 
             logger.info("Forwarding request to: {}", targetUrl);
 
+            // Get WebClient with appropriate SSL configuration
+            WebClient client = getWebClient(route.getClient().isVerifySsl());
+
             // Create HTTP request
-            HttpRequest<Buffer> request = webClient
+            HttpRequest<Buffer> request = client
                     .post(uri.getPort() > 0 ? uri.getPort() : (uri.getScheme().equals("https") ? 443 : 80),
                             uri.getHost(),
                             uri.getPath())
@@ -74,7 +94,7 @@ public class ProxyClient {
 
             // Send request
             if (stream) {
-                return handleStreamingRequest(ctx, request, transformedBody);
+                return handleStreamingRequestRealTime(ctx, request, transformedBody);
             } else {
                 return handleNonStreamingRequest(ctx, request, transformedBody, route);
             }
@@ -213,29 +233,84 @@ public class ProxyClient {
     }
 
     private Future<Void> handleStreamingRequest(RoutingContext ctx, HttpRequest<Buffer> request, JsonObject body) {
-        return request.sendJsonObject(body)
-                .compose(response -> {
-                    // Set up SSE response
-                    ctx.response()
-                            .setStatusCode(response.statusCode())
-                            .putHeader("Content-Type", "text/event-stream")
-                            .putHeader("Cache-Control", "no-cache")
-                            .putHeader("Connection", "keep-alive")
-                            .setChunked(true);
+        // Set up SSE response headers before streaming
+        ctx.response()
+                .setStatusCode(200)
+                .putHeader("Content-Type", "text/event-stream")
+                .putHeader("Cache-Control", "no-cache")
+                .putHeader("Connection", "keep-alive")
+                .setChunked(true);
 
-                    // Forward the streaming response
+        return request
+                .sendJsonObject(body)
+                .compose(response -> {
+                    // Check if the response was successful
+                    if (response.statusCode() >= 400) {
+                        logger.error("Streaming request failed with status: {}", response.statusCode());
+                        if (!ctx.response().ended()) {
+                            ctx.response()
+                                    .setStatusCode(response.statusCode())
+                                    .end("data: {\"error\":\"Stream failed\"}\n\n");
+                        }
+                        return Future.succeededFuture();
+                    }
+
+                    // For Vert.x WebClient, we need to use sendStream for real streaming
+                    // However, the response is already received, so we forward it
+                    // In a real implementation, we'd use .as(BodyCodec.pipe(pipe)) for true streaming
                     String responseBody = response.bodyAsString();
+
+                    // Forward the entire stream content
                     ctx.response().write(responseBody);
                     ctx.response().end();
 
+                    logger.debug("Streaming response forwarded successfully");
                     return Future.succeededFuture();
                 })
                 .recover(err -> {
                     logger.error("Streaming request failed", err);
                     if (!ctx.response().ended()) {
-                        ctx.response()
-                                .setStatusCode(502)
-                                .end("data: {\"error\":\"Stream failed\"}\n\n");
+                        if (!ctx.response().headWritten()) {
+                            ctx.response().setStatusCode(502);
+                        }
+                        ctx.response().end("data: {\"error\":\"Stream failed\"}\n\n");
+                    }
+                    return Future.succeededFuture();
+                })
+                .mapEmpty();
+    }
+
+    /**
+     * Implements true real-time streaming by forwarding chunks as they arrive from the provider.
+     * Uses Vert.x Pipe to stream data with proper backpressure handling.
+     */
+    private Future<Void> handleStreamingRequestRealTime(RoutingContext ctx, HttpRequest<Buffer> request, JsonObject body) {
+        // Set up SSE response headers
+        ctx.response()
+                .setStatusCode(200)
+                .putHeader("Content-Type", "text/event-stream")
+                .putHeader("Cache-Control", "no-cache")
+                .putHeader("Connection", "keep-alive")
+                .putHeader("X-Accel-Buffering", "no") // Disable nginx buffering
+                .setChunked(true);
+
+        // Use BodyCodec.pipe() to stream the response directly to the client
+        // This forwards chunks as they arrive without buffering the entire response
+        return request
+                .as(BodyCodec.pipe(ctx.response()))
+                .sendJsonObject(body)
+                .compose(response -> {
+                    if (response.statusCode() >= 400) {
+                        logger.error("Streaming request failed with status: {}", response.statusCode());
+                    } else {
+                        logger.debug("Streaming response completed successfully");
+                    }
+                    return Future.succeededFuture();
+                })
+                .recover(err -> {
+                    logger.error("Streaming request failed", err);
+                    if (!ctx.response().ended()) {
+                        ctx.response().end();
                     }
                     return Future.succeededFuture();
                 })
