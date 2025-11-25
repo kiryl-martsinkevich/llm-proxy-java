@@ -26,9 +26,27 @@ import org.slf4j.LoggerFactory;
 import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.List;
 
 public class ProxyClient {
     private static final Logger logger = LoggerFactory.getLogger(ProxyClient.class);
+
+    // Common tracing headers that should be preserved and returned in responses
+    private static final Set<String> TRACING_HEADERS = Set.of(
+            "x-request-id",
+            "x-correlation-id",
+            "x-trace-id",
+            "traceparent",      // W3C Trace Context
+            "tracestate",       // W3C Trace Context
+            "x-b3-traceid",     // Zipkin B3
+            "x-b3-spanid",      // Zipkin B3
+            "x-b3-parentspanid",// Zipkin B3
+            "x-b3-sampled",     // Zipkin B3
+            "x-b3-flags",       // Zipkin B3
+            "x-cloud-trace-context", // Google Cloud
+            "x-amzn-trace-id"   // AWS
+    );
 
     private final Vertx vertx;
     private final Map<Boolean, WebClient> webClientCache;
@@ -59,6 +77,30 @@ public class ProxyClient {
             logger.debug("Created WebClient with SSL verification: {}", verify);
             return WebClient.create(vertx, options);
         });
+    }
+
+    /**
+     * Applies tracing headers from the incoming request to the outgoing response.
+     * This ensures distributed tracing works correctly across the proxy.
+     *
+     * @param ctx The routing context containing the original request and response
+     */
+    private void applyTracingHeaders(RoutingContext ctx) {
+        MultiMap incomingHeaders = ctx.request().headers();
+        int headersApplied = 0;
+
+        for (String tracingHeader : TRACING_HEADERS) {
+            String value = incomingHeaders.get(tracingHeader);
+            if (value != null && !value.isEmpty()) {
+                ctx.response().putHeader(tracingHeader, value);
+                headersApplied++;
+                logger.debug("Applied tracing header: {} = {}", tracingHeader, value);
+            }
+        }
+
+        if (headersApplied > 0) {
+            logger.debug("Applied {} tracing headers to response", headersApplied);
+        }
     }
 
     public Future<Void> forwardRequest(RoutingContext ctx, JsonObject requestBody, RouteConfig route, boolean stream) {
@@ -176,7 +218,10 @@ public class ProxyClient {
                             .setStatusCode(response.statusCode())
                             .putHeader("Content-Type", "application/json");
 
-                    // Copy response headers
+                    // Apply tracing headers from original request
+                    applyTracingHeaders(ctx);
+
+                    // Copy response headers from provider
                     response.headers().forEach(entry -> {
                         if (!entry.getKey().equalsIgnoreCase("content-length") &&
                             !entry.getKey().equalsIgnoreCase("transfer-encoding")) {
@@ -311,6 +356,9 @@ public class ProxyClient {
                 .putHeader("Connection", "keep-alive")
                 .putHeader("X-Accel-Buffering", "no") // Disable nginx buffering
                 .setChunked(true);
+
+        // Apply tracing headers from original request
+        applyTracingHeaders(ctx);
 
         // Use BodyCodec.pipe() to stream the response directly to the client
         // This forwards chunks as they arrive without buffering the entire response
