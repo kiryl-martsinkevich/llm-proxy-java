@@ -362,14 +362,19 @@ public class ProxyClient {
 
         // Use BodyCodec.pipe() to stream the response directly to the client
         // This forwards chunks as they arrive without buffering the entire response
+        // Pass 'false' to prevent automatic close - we'll close manually after completion
         return request
-                .as(BodyCodec.pipe(ctx.response()))
+                .as(BodyCodec.pipe(ctx.response(), false))
                 .sendJsonObject(body)
                 .compose(response -> {
                     if (response.statusCode() >= 400) {
                         logger.error("Streaming request failed with status: {}", response.statusCode());
                     } else {
                         logger.debug("Streaming response completed successfully");
+                    }
+                    // Explicitly end the response after pipe completes
+                    if (!ctx.response().ended()) {
+                        ctx.response().end();
                     }
                     return Future.succeededFuture();
                 })
