@@ -3,6 +3,7 @@ package com.llmproxy.client;
 import com.llmproxy.config.ProviderConfig;
 import com.llmproxy.config.RouteConfig;
 import com.llmproxy.transformer.ContentTransformer;
+import com.llmproxy.transformer.FormatConverter;
 import com.llmproxy.transformer.HeaderTransformer;
 import com.llmproxy.transformer.JsonPathTransformer;
 import com.llmproxy.util.RetryHandler;
@@ -48,11 +49,26 @@ public class ProxyClient {
             "x-amzn-trace-id"   // AWS
     );
 
+    // Hop-by-hop headers that should never be forwarded by a proxy (RFC 2616 Section 13.5.1)
+    private static final Set<String> HOP_BY_HOP_HEADERS = Set.of(
+            "host",
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "content-length"  // Will be recalculated by the HTTP client
+    );
+
     private final Vertx vertx;
     private final Map<Boolean, WebClient> webClientCache;
     private final HeaderTransformer headerTransformer;
     private final ContentTransformer contentTransformer;
     private final JsonPathTransformer jsonPathTransformer;
+    private final FormatConverter formatConverter;
     private final RetryHandler retryHandler;
 
     public ProxyClient(Vertx vertx) {
@@ -61,6 +77,7 @@ public class ProxyClient {
         this.headerTransformer = new HeaderTransformer();
         this.contentTransformer = new ContentTransformer();
         this.jsonPathTransformer = new JsonPathTransformer();
+        this.formatConverter = new FormatConverter();
         this.retryHandler = new RetryHandler(vertx);
     }
 
@@ -103,10 +120,38 @@ public class ProxyClient {
         }
     }
 
+    /**
+     * Forward request with same source and target API format.
+     */
     public Future<Void> forwardRequest(RoutingContext ctx, JsonObject requestBody, RouteConfig route, boolean stream) {
+        return forwardRequest(ctx, requestBody, route, stream, null);
+    }
+
+    /**
+     * Forward request with optional format conversion.
+     * @param sourceApiType The API type of the incoming request (null means same as target)
+     */
+    public Future<Void> forwardRequest(RoutingContext ctx, JsonObject requestBody, RouteConfig route,
+                                       boolean stream, ProviderConfig.Type sourceApiType) {
         try {
-            // Transform request
-            JsonObject transformedBody = transformRequest(requestBody, route);
+            String originalModel = requestBody.getString("model");
+            ProviderConfig.Type targetApiType = route.getProvider().getType();
+
+            // Convert request format if needed
+            JsonObject convertedBody = requestBody;
+            boolean needsResponseConversion = false;
+
+            if (sourceApiType != null && sourceApiType != targetApiType) {
+                if (sourceApiType == ProviderConfig.Type.ANTHROPIC && targetApiType == ProviderConfig.Type.OPENAI) {
+                    logger.debug("Converting request from Anthropic to OpenAI format");
+                    convertedBody = formatConverter.anthropicToOpenAIRequest(requestBody);
+                    needsResponseConversion = true;
+                }
+                // Add other conversions as needed (OpenAI->Anthropic, etc.)
+            }
+
+            // Transform request (model replacement, JSONPath ops, regex)
+            JsonObject transformedBody = transformRequest(convertedBody, route);
 
             // Build target URL
             String targetUrl = buildTargetUrl(route.getProvider());
@@ -134,14 +179,21 @@ public class ProxyClient {
             }
             headers.set("Content-Type", "application/json");
 
-            // Apply headers to request
-            headers.forEach(entry -> request.putHeader(entry.getKey(), entry.getValue()));
+            // Apply headers to request, filtering out hop-by-hop headers
+            // (Host header is set automatically by WebClient based on target URI)
+            headers.forEach(entry -> {
+                if (!HOP_BY_HOP_HEADERS.contains(entry.getKey().toLowerCase())) {
+                    request.putHeader(entry.getKey(), entry.getValue());
+                }
+            });
 
             // Send request
             if (stream) {
-                return handleStreamingRequestRealTime(ctx, request, transformedBody);
+                return handleStreamingRequestRealTime(ctx, request, transformedBody,
+                        needsResponseConversion ? sourceApiType : null, originalModel);
             } else {
-                return handleNonStreamingRequest(ctx, request, transformedBody, route);
+                return handleNonStreamingRequest(ctx, request, transformedBody, route,
+                        needsResponseConversion ? sourceApiType : null, originalModel);
             }
 
         } catch (Exception e) {
@@ -195,7 +247,8 @@ public class ProxyClient {
     }
 
     private Future<Void> handleNonStreamingRequest(RoutingContext ctx, HttpRequest<Buffer> request,
-                                                     JsonObject body, RouteConfig route) {
+                                                     JsonObject body, RouteConfig route,
+                                                     ProviderConfig.Type convertResponseTo, String originalModel) {
         // Wrap request in retry logic
         int maxRetries = route.getClient().getRetries();
         String context = String.format("Request to %s (model: %s)",
@@ -248,6 +301,15 @@ public class ProxyClient {
                     // Transform response if needed
                     if (responseBody != null && !route.getTransformations().getResponse().getJsonPathOps().isEmpty()) {
                         responseBody = jsonPathTransformer.transform(responseBody, route.getTransformations().getResponse());
+                    }
+
+                    // Convert response format if needed (e.g., OpenAI -> Anthropic)
+                    if (responseBody != null && convertResponseTo != null && response.statusCode() < 400) {
+                        if (convertResponseTo == ProviderConfig.Type.ANTHROPIC &&
+                            route.getProvider().getType() == ProviderConfig.Type.OPENAI) {
+                            logger.debug("Converting response from OpenAI to Anthropic format");
+                            responseBody = formatConverter.openAIToAnthropicResponse(responseBody, originalModel);
+                        }
                     }
 
                     ctx.response().end(responseBody != null ? responseBody.encode() : response.bodyAsString());
@@ -344,47 +406,115 @@ public class ProxyClient {
     }
 
     /**
-     * Implements true real-time streaming by forwarding chunks as they arrive from the provider.
-     * Uses Vert.x Pipe to stream data with proper backpressure handling.
+     * Implements streaming by forwarding chunks from the provider.
+     * Handles format conversion for cross-API streaming (e.g., OpenAI SSE -> Anthropic SSE).
      */
-    private Future<Void> handleStreamingRequestRealTime(RoutingContext ctx, HttpRequest<Buffer> request, JsonObject body) {
-        // Set up SSE response headers
-        ctx.response()
-                .setStatusCode(200)
-                .putHeader("Content-Type", "text/event-stream")
-                .putHeader("Cache-Control", "no-cache")
-                .putHeader("Connection", "keep-alive")
-                .putHeader("X-Accel-Buffering", "no") // Disable nginx buffering
-                .setChunked(true);
+    private Future<Void> handleStreamingRequestRealTime(RoutingContext ctx, HttpRequest<Buffer> request,
+                                                        JsonObject body, ProviderConfig.Type convertResponseTo,
+                                                        String originalModel) {
+        io.vertx.core.Promise<Void> promise = io.vertx.core.Promise.promise();
 
-        // Apply tracing headers from original request
-        applyTracingHeaders(ctx);
+        request.sendJsonObject(body, ar -> {
+            if (ar.failed()) {
+                logger.error("Streaming request failed to connect", ar.cause());
+                if (!ctx.response().ended()) {
+                    ctx.response()
+                            .setStatusCode(502)
+                            .putHeader("Content-Type", "application/json")
+                            .end("{\"error\":{\"message\":\"Failed to connect to upstream: " +
+                                    ar.cause().getMessage().replace("\"", "'") + "\",\"type\":\"proxy_error\"}}");
+                }
+                promise.complete();
+                return;
+            }
 
-        // Use BodyCodec.pipe() to stream the response directly to the client
-        // This forwards chunks as they arrive without buffering the entire response
-        // Pass 'false' to prevent automatic close - we'll close manually after completion
-        return request
-                .as(BodyCodec.pipe(ctx.response(), false))
-                .sendJsonObject(body)
-                .compose(response -> {
-                    if (response.statusCode() >= 400) {
-                        logger.error("Streaming request failed with status: {}", response.statusCode());
-                    } else {
-                        logger.debug("Streaming response completed successfully");
+            HttpResponse<Buffer> response = ar.result();
+            int statusCode = response.statusCode();
+            Buffer responseBody = response.body();
+
+            logger.debug("Upstream response: status={}, bodyLength={}", statusCode,
+                    responseBody != null ? responseBody.length() : 0);
+
+            // Set response status code from upstream
+            ctx.response().setStatusCode(statusCode);
+
+            // Apply tracing headers from original request
+            applyTracingHeaders(ctx);
+
+            // Handle error responses
+            if (statusCode >= 400) {
+                // Copy error response headers
+                response.headers().forEach(entry -> {
+                    String key = entry.getKey().toLowerCase();
+                    if (!HOP_BY_HOP_HEADERS.contains(key)) {
+                        ctx.response().putHeader(entry.getKey(), entry.getValue());
                     }
-                    // Explicitly end the response after pipe completes
-                    if (!ctx.response().ended()) {
-                        ctx.response().end();
+                });
+
+                if (responseBody != null && responseBody.length() > 0) {
+                    ctx.response().end(responseBody);
+                } else {
+                    ctx.response().end();
+                }
+
+                logger.error("Streaming request failed with status: {} - {}",
+                        statusCode, responseBody != null ? responseBody.toString() : "no body");
+                promise.complete();
+                return;
+            }
+
+            // Success - set up streaming response
+            ctx.response().setChunked(true);
+            ctx.response().putHeader("X-Accel-Buffering", "no");
+
+            // Convert streaming response if needed
+            if (convertResponseTo == ProviderConfig.Type.ANTHROPIC && responseBody != null) {
+                // Convert OpenAI SSE to Anthropic SSE format
+                ctx.response().putHeader("Content-Type", "text/event-stream");
+                String convertedStream = convertOpenAIStreamToAnthropic(responseBody.toString(), originalModel);
+                ctx.response().end(convertedStream);
+            } else {
+                // No conversion needed - forward as-is
+                response.headers().forEach(entry -> {
+                    String key = entry.getKey().toLowerCase();
+                    if (!HOP_BY_HOP_HEADERS.contains(key)) {
+                        ctx.response().putHeader(entry.getKey(), entry.getValue());
                     }
-                    return Future.succeededFuture();
-                })
-                .recover(err -> {
-                    logger.error("Streaming request failed", err);
-                    if (!ctx.response().ended()) {
-                        ctx.response().end();
-                    }
-                    return Future.succeededFuture();
-                })
-                .mapEmpty();
+                });
+
+                if (responseBody != null && responseBody.length() > 0) {
+                    ctx.response().end(responseBody);
+                } else {
+                    ctx.response().end();
+                }
+            }
+
+            logger.debug("Streaming response completed successfully");
+            promise.complete();
+        });
+
+        return promise.future();
+    }
+
+    /**
+     * Converts an OpenAI SSE stream to Anthropic SSE format.
+     */
+    private String convertOpenAIStreamToAnthropic(String openaiStream, String originalModel) {
+        StringBuilder result = new StringBuilder();
+        FormatConverter.StreamingState state = new FormatConverter.StreamingState();
+
+        // Parse SSE events
+        String[] lines = openaiStream.split("\n");
+        for (String line : lines) {
+            if (line.startsWith("data: ")) {
+                String data = line.substring(6).trim();
+                if (!data.isEmpty()) {
+                    String converted = formatConverter.openAIStreamChunkToAnthropic(data, originalModel, state);
+                    result.append(converted);
+                }
+            }
+        }
+
+        return result.toString();
     }
 }

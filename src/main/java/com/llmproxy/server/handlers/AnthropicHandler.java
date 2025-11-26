@@ -1,6 +1,7 @@
 package com.llmproxy.server.handlers;
 
 import com.llmproxy.client.ProxyClient;
+import com.llmproxy.config.ProviderConfig;
 import com.llmproxy.config.ProxyConfig;
 import com.llmproxy.config.RouteConfig;
 import io.vertx.core.Vertx;
@@ -50,8 +51,9 @@ public class AnthropicHandler {
             // Check if streaming is requested
             Boolean stream = requestBody.getBoolean("stream", false);
 
-            // Forward request to provider
-            client.forwardRequest(ctx, requestBody, route, stream)
+            // Forward request to provider, indicating this is an Anthropic-format request
+            // If the target is not Anthropic, the ProxyClient will convert the format
+            client.forwardRequest(ctx, requestBody, route, stream, ProviderConfig.Type.ANTHROPIC)
                     .onSuccess(v -> logger.info("Request completed successfully"))
                     .onFailure(err -> {
                         logger.error("Request failed", err);
